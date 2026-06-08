@@ -22,16 +22,42 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class HidenCloud:
-    def __init__(self, cookie_str, tg_config=None):
+    def __init__(self, cookie_str, tg_config=None, proxy=None):
         self.base_url = "https://dash.hidencloud.com"
         self.cookie_str = cookie_str
         self.tg_config = tg_config
+        self.proxy = proxy
         self.session = requests.Session(impersonate="chrome110")
+        
+        # 配置代理
+        if self.proxy:
+            self.session.proxies = {
+                "http": self.proxy,
+                "https": self.proxy
+            }
+            
         self.username = "Unknown"
         self.balance = "未知"
         self.updated_cookies = False
         self.csrf_token = ""
         self.parse_and_set_cookies()
+        self.test_proxy_ip()  # 初始化时测试代理状态
+
+    def test_proxy_ip(self):
+        """测试代理连通性并输出当前出口 IP"""
+        if not self.proxy:
+            logger.info("ℹ️ 未配置代理，将使用 GitHub Actions 默认 IP 直连")
+            return
+        try:
+            # 使用 session 发送请求，检测代理是否生效
+            resp = self.session.get("https://httpbin.org/ip", timeout=10)
+            if resp.status_code == 200:
+                current_ip = resp.json().get("origin")
+                logger.info(f"🌐 代理连接成功！当前网络出口 IP: {current_ip}")
+            else:
+                logger.warning(f"⚠️ 代理连接返回异常状态码: {resp.status_code}，尝试继续任务...")
+        except Exception as e:
+            logger.error(f"❌ 代理连通性测试失败，请检查代理节点是否存活: {e}")
 
     def parse_and_set_cookies(self):
         """解析 Cookie 字符串并设置到 Session"""
@@ -39,7 +65,6 @@ class HidenCloud:
             return
         
         cookies = {}
-        # 改进解析，处理可能存在的引号或复杂值
         for item in self.cookie_str.split(';'):
             if '=' in item:
                 parts = item.strip().split('=', 1)
@@ -51,7 +76,6 @@ class HidenCloud:
     def get_cookie_string(self):
         """获取当前的 Cookie 字符串 (确保捕获所有域名的 Cookie)"""
         cookie_list = []
-        # items() 返回的是 (name, value) 元组
         for name, value in self.session.cookies.items():
             cookie_list.append(f"{name}={value}")
         return "; ".join(cookie_list)
@@ -120,6 +144,7 @@ class HidenCloud:
     def get_hitokoto(self):
         """获取每日一言"""
         try:
+            # 这里的获取一言同样会通过代理发出（如果配置了代理的话）
             resp = requests.get("https://v1.hitokoto.cn/?encode=json", timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
@@ -136,7 +161,6 @@ class HidenCloud:
         url = f"https://api.telegram.org/bot{self.tg_config['bot_token']}/sendMessage"
         
         hitokoto = self.get_hitokoto()
-        # 优化通知排版
         formatted_message = (
             f"☁️ **HidenCloud 自动续费任务**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -155,7 +179,9 @@ class HidenCloud:
             "parse_mode": "Markdown"
         }
         try:
-            resp = requests.post(url, json=payload, timeout=10)
+            # 使用单独的请求（或跟随 session），通常 TG 官方接口在部分环境中需要代理
+            # 这里默认跟随带代理的 session 发送，防止 Actions 环境连不上 TG
+            resp = self.session.post(url, json=payload, timeout=10)
             if resp.status_code == 200:
                 logger.info("Telegram 通知发送成功")
             else:
@@ -196,10 +222,8 @@ class HidenCloud:
                 
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, 'html.parser')
-                # 刷新 CSRF
                 self.get_csrf_token(html=resp.text)
                 
-                # 提取用户名 - 优先找 Email
                 email_tag = soup.select_one('p.font-light.text-gray-500')
                 if not email_tag:
                     email_tag = soup.find('p', string=re.compile(r'.+@.+\..+'))
@@ -207,14 +231,12 @@ class HidenCloud:
                 if email_tag and "[email" not in email_tag.get_text():
                     self.username = email_tag.get_text().strip()
                 else:
-                    # 备选：查找用户名链接 (通常是真实姓名)
                     name_tag = soup.select_one('h3 > a[href="#"]')
                     if name_tag:
                         self.username = name_tag.get_text().strip()
                     elif email_tag:
                         self.username = email_tag.get_text().strip()
 
-                # 提取余额 - 查找包含金额的卡片
                 balance_link = soup.select_one('a[href*="/balance"]')
                 if balance_link:
                     balance_tag = balance_link.find(['dt', 'h4', 'div'], class_=re.compile(r'font-extrabold|text-3xl'))
@@ -222,7 +244,6 @@ class HidenCloud:
                         self.balance = balance_tag.get_text().strip()
                 
                 if self.balance == "未知":
-                    # 兜底：正则搜索货币符号
                     balance_text = soup.find(string=re.compile(r'(¥|€|余额)\s*\d+\.\d+'))
                     if balance_text:
                         self.balance = balance_text.strip()
@@ -249,7 +270,6 @@ class HidenCloud:
         logger.info(f"正在为服务 {service_id} 申请续期...")
         manage_url = f"{self.base_url}/service/{service_id}/manage"
         
-        # 获取管理页面并提取 Token
         resp = self.session.get(manage_url, timeout=20)
         token = self.get_csrf_token(html=resp.text)
         if not token:
@@ -260,7 +280,6 @@ class HidenCloud:
             "_token": token,
             "days": "7"
         }
-        # 添加 XSRF Token 支持
         xsrf_token = self.session.cookies.get("XSRF-TOKEN")
         headers = {
             "Referer": manage_url,
@@ -273,24 +292,20 @@ class HidenCloud:
 
         try:
             resp = self.session.post(renew_url, data=data, headers=headers, timeout=20)
-            # 如果跳转到了账单页，或者响应中包含成功信息，说明续期申请成功
             if "invoice" in resp.url or "payment" in resp.url:
                 return True, "申请成功"
             
-            # 检查页面是否包含错误信息
             soup_res = BeautifulSoup(resp.text, 'html.parser')
             alert = soup_res.find(['div', 'span'], attrs={'role': 'alert'})
             if alert:
                 alert_text = alert.get_text(strip=True)
                 if "only renew" in alert_text or "expires in" in alert_text:
-                    # 提取剩余天数
                     days_match = re.search(r'expires in (\d+) days', alert_text)
                     days_info = f" (剩余 {days_match.group(1)} 天)" if days_match else ""
                     return True, f"未到期{days_info}"
                 return False, f"申请失败: {alert_text}"
             
             if resp.status_code == 200 and "dash.hidencloud.com/service" in resp.url:
-                # 仍在管理页但没报错，可能是已经申请过或者其他情况
                 return True, "状态正常"
                 
             return False, f"续期请求失败: {resp.status_code}"
@@ -303,15 +318,12 @@ class HidenCloud:
         invoice_list_url = f"{self.base_url}/service/{service_id}/invoices?where=unpaid"
         try:
             resp = self.session.get(invoice_list_url, timeout=20)
-            # 查找所有账单链接 (使用 BeautifulSoup 过滤通知栏链接)
             soup = BeautifulSoup(resp.text, 'html.parser')
             invoice_links = []
             
-            # 查找所有的 a 标签
             for a in soup.find_all('a', href=True):
                 href = a['href']
                 if '/invoice/' in href and 'download' not in href:
-                    # 检查父容器是否包含 "Unpaid" 或 "待支付"
                     parent = a.find_parent(['tr', 'div', 'li'])
                     if parent:
                         parent_text = parent.get_text()
@@ -322,7 +334,7 @@ class HidenCloud:
                 return True, "无待支付订单"
 
             success_count = 0
-            invoice_links = list(set(invoice_links)) # 去重
+            invoice_links = list(set(invoice_links))
             
             for inv_link in invoice_links:
                 if not inv_link.startswith('http'):
@@ -332,14 +344,11 @@ class HidenCloud:
                 inv_resp = self.session.get(inv_link, timeout=20)
                 inv_soup = BeautifulSoup(inv_resp.text, 'html.parser')
                 
-                # 寻找支付表单
                 pay_form = None
                 for form in inv_soup.find_all('form'):
                     action = form.get('action', '')
-                    # 排除充值表单
                     if 'balance/add' in action: continue
                     
-                    # 查找提交按钮
                     btn = form.find(['button', 'input'], attrs={'type': 'submit'})
                     if not btn: btn = form.find('button')
                     
@@ -348,7 +357,6 @@ class HidenCloud:
                         break
                 
                 if not pay_form:
-                    # 降级尝试：寻找任何包含 invoice 或 payment 的表单
                     for form in inv_soup.find_all('form'):
                         action = form.get('action', '')
                         if 'invoice' in action or 'payment' in action:
@@ -360,14 +368,12 @@ class HidenCloud:
                     if not action.startswith('http'):
                         action = self.base_url + action
                         
-                    # 提取表单数据
                     payload = {}
                     for inp in pay_form.find_all('input'):
                         name = inp.get('name')
                         if name:
                             payload[name] = inp.get('value', '')
                     
-                    # 补充 Token
                     token = self.get_csrf_token(html=inv_resp.text)
                     if token: payload['_token'] = token
                     
@@ -424,15 +430,10 @@ class HidenCloud:
         logger.info(f"任务完成报告:\n{report}")
         self.send_tg_notification(report)
 
-        # 检查并更新 Cookie
         new_cookie_str = self.get_cookie_string()
         if new_cookie_str != self.cookie_str:
             logger.info("检测到 Cookie 已刷新，准备同步到本地及 GitHub Secrets")
-            
-            # 1. 更新 GitHub Secrets
             self.update_github_secret(new_cookie_str)
-            
-            # 2. 更新本地 config.json (如果运行在本地)
             self.update_local_config(new_cookie_str)
 
     def update_local_config(self, new_cookie):
@@ -444,10 +445,8 @@ class HidenCloud:
                 with open(config_path, 'r') as f:
                     config_data = json.load(f)
                 
-                # 寻找并更新匹配的账号
                 updated = False
                 for acc in config_data.get("accounts", []):
-                    # 通过 cookie_str 的部分内容或用户名匹配 (简单处理：如果只有一个账号就直接更)
                     if acc.get("cookie_str") == self.cookie_str or len(config_data.get("accounts", [])) == 1:
                         acc["cookie_str"] = new_cookie
                         updated = True
@@ -462,40 +461,51 @@ class HidenCloud:
 
 def main():
     config = {}
-    # 按照参考项目逻辑：从环境变量 HIDEN_COOKIE 读取
     env_cookies = os.environ.get("HIDEN_COOKIE")
+    env_proxy = os.environ.get("HIDEN_PROXY")  # 从环境变量获取全局代理
     
-    # 兼容本地 config.json
-    config_cookies = []
+    accounts_to_run = []
     current_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(current_dir, "config.json")
     
-    if env_cookies:
-        logger.info("从环境变量 HIDEN_COOKIE 加载账号信息")
-        # 支持 & 或 换行符 分隔多账号
-        account_cookies = re.split(r'[&\n]', env_cookies)
-    elif os.path.exists(config_path):
-        logger.info("从本地 config.json 加载账号信息")
+    # 优先从本地配置中解析，建立“Cookie -> 专属代理”的映射关系
+    config_proxies = {}
+    global_config_proxy = None
+
+    if os.path.exists(config_path):
+        logger.info("正在读取 config.json 配置文件...")
         try:
             with open(config_path, 'r') as f:
                 config = json.load(f)
+                global_config_proxy = config.get("proxy")  # 整个 json 的全局代理
+                
                 accounts = config.get("accounts", [])
-                account_cookies = []
                 for acc in accounts:
+                    c_str = ""
                     if acc.get("cookie_str"):
-                        account_cookies.append(acc.get("cookie_str"))
+                        c_str = acc.get("cookie_str")
                     elif acc.get("cookies"):
-                        # 兼容字典格式
                         if isinstance(acc["cookies"], dict):
                             c_str = "; ".join([f"{k}={v}" for k, v in acc["cookies"].items()])
                         else:
                             c_str = str(acc["cookies"])
-                        account_cookies.append(c_str)
+                    
+                    if c_str:
+                        # 记录此 Cookie 是否有单独绑定的独立代理
+                        if acc.get("proxy"):
+                            config_proxies[c_str] = acc.get("proxy")
+                        if not env_cookies:  # 如果没设置环境变量，直接用 config 的账号
+                            accounts_to_run.append(c_str)
         except Exception as e:
             logger.error(f"读取 config.json 失败: {e}")
-            return
-    else:
-        logger.error("未找到 HIDEN_COOKIE 环境变量或 config.json")
+
+    # 如果有环境变量，以环境变量的账号为主
+    if env_cookies:
+        logger.info("从环境变量 HIDEN_COOKIE 加载账号信息")
+        accounts_to_run = [c.strip() for c in re.split(r'[&\n]', env_cookies) if c.strip()]
+
+    if not accounts_to_run:
+        logger.error("❌ 未找到任何可用的 HIDEN_COOKIE（环境变量及配置文件皆为空）")
         return
 
     # TG 配置
@@ -504,10 +514,18 @@ def main():
         "chat_id": os.environ.get("TG_CHAT_ID") or config.get("telegram", {}).get("chat_id")
     }
 
-    for cookie_str in account_cookies:
+    # 循环执行每个账号
+    for cookie_str in accounts_to_run:
         if not cookie_str.strip(): continue
+        
+        # 代理优先级判定：
+        # 1. 优先使用 config.json 中该账号绑定的独享代理
+        # 2. 其次使用系统环境变量 HIDEN_PROXY
+        # 3. 再次使用 config.json 根目录下的全局代理 proxy
+        final_proxy = config_proxies.get(cookie_str) or env_proxy or global_config_proxy
+        
         try:
-            bot = HidenCloud(cookie_str, tg_config)
+            bot = HidenCloud(cookie_str, tg_config, proxy=final_proxy)
             bot.run_task()
         except Exception as e:
             logger.error(f"处理账号时发生异常: {e}")
