@@ -30,6 +30,7 @@ jobs:
       - name: Run Renew Script
         env:
           HIDEN_COOKIE: ${{ secrets.HIDEN_COOKIE }}
+          HIDEN_PROXY: ${{ secrets.HIDEN_PROXY }} # 👈 新增：将代理配置传入脚本
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GH_PAT: ${{ secrets.GH_PAT }}
