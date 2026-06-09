@@ -142,10 +142,13 @@ class HidenCloud:
             logger.error(f"更新 Secret 过程出错: {e}")
 
     def get_hitokoto(self):
-        """获取每日一言"""
+        """获取每日一言（使用独立 session，防止污染主 Cookie）"""
         try:
-            # 这里的获取一言同样会通过代理发出（如果配置了代理的话）
-            resp = requests.get("https://v1.hitokoto.cn/?encode=json", timeout=10)
+            hitokoto_session = requests.Session(impersonate="chrome110")
+            if self.proxy:
+                hitokoto_session.proxies = {"http": self.proxy, "https": self.proxy}
+                
+            resp = hitokoto_session.get("https://v1.hitokoto.cn/?encode=json", timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
                 return f"『{data['hitokoto']}』—— {data['from']}"
@@ -154,7 +157,7 @@ class HidenCloud:
         return "保持热爱，奔赴山海。"
 
     def send_tg_notification(self, message):
-        """发送 Telegram 通知"""
+        """发送 Telegram 通知（使用独立 session，防止 Cookie 冲突报错）"""
         if not self.tg_config or not self.tg_config.get("bot_token") or not self.tg_config.get("chat_id"):
             return
 
@@ -179,9 +182,15 @@ class HidenCloud:
             "parse_mode": "Markdown"
         }
         try:
-            # 使用单独的请求（或跟随 session），通常 TG 官方接口在部分环境中需要代理
-            # 这里默认跟随带代理的 session 发送，防止 Actions 环境连不上 TG
-            resp = self.session.post(url, json=payload, timeout=10)
+            # 独立创建一个临时的 TG 网络会话，完全避开与 HidenCloud 的 Cookie 混合
+            tg_session = requests.Session(impersonate="chrome110")
+            if self.proxy:
+                tg_session.proxies = {
+                    "http": self.proxy,
+                    "https": self.proxy
+                }
+                
+            resp = tg_session.post(url, json=payload, timeout=10)
             if resp.status_code == 200:
                 logger.info("Telegram 通知发送成功")
             else:
