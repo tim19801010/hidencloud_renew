@@ -26,15 +26,14 @@ class HidenCloud:
         self.base_url = "https://dash.hidencloud.com"
         self.cookie_str = cookie_str
         self.tg_config = tg_config
-        self.proxy = proxy
-        self.session = requests.Session(impersonate="chrome110")
         
-        # 配置代理
-        if self.proxy:
-            self.session.proxies = {
-                "http": self.proxy,
-                "https": self.proxy
-            }
+        # 兼容处理：将 socks5:// 自动转换为 socks5h:// 确保远程 DNS 解析成功
+        if proxy and proxy.startswith("socks5://"):
+            proxy = proxy.replace("socks5://", "socks5h://")
+        self.proxy = proxy
+        
+        # curl_cffi 最佳实践：直接在初始化 Session 时作为命名参数传入 proxy
+        self.session = requests.Session(impersonate="chrome110", proxy=self.proxy)
             
         self.username = "Unknown"
         self.balance = "未知"
@@ -144,10 +143,7 @@ class HidenCloud:
     def get_hitokoto(self):
         """获取每日一言（使用独立 session，防止污染主 Cookie）"""
         try:
-            hitokoto_session = requests.Session(impersonate="chrome110")
-            if self.proxy:
-                hitokoto_session.proxies = {"http": self.proxy, "https": self.proxy}
-                
+            hitokoto_session = requests.Session(impersonate="chrome110", proxy=self.proxy)
             resp = hitokoto_session.get("https://v1.hitokoto.cn/?encode=json", timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
@@ -183,13 +179,7 @@ class HidenCloud:
         }
         try:
             # 独立创建一个临时的 TG 网络会话，完全避开与 HidenCloud 的 Cookie 混合
-            tg_session = requests.Session(impersonate="chrome110")
-            if self.proxy:
-                tg_session.proxies = {
-                    "http": self.proxy,
-                    "https": self.proxy
-                }
-                
+            tg_session = requests.Session(impersonate="chrome110", proxy=self.proxy)
             resp = tg_session.post(url, json=payload, timeout=10)
             if resp.status_code == 200:
                 logger.info("Telegram 通知发送成功")
@@ -527,10 +517,7 @@ def main():
     for cookie_str in accounts_to_run:
         if not cookie_str.strip(): continue
         
-        # 代理优先级判定：
-        # 1. 优先使用 config.json 中该账号绑定的独享代理
-        # 2. 其次使用系统环境变量 HIDEN_PROXY
-        # 3. 再次使用 config.json 根目录下的全局代理 proxy
+        # 代理优先级判定
         final_proxy = config_proxies.get(cookie_str) or env_proxy or global_config_proxy
         
         try:
