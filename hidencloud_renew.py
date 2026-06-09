@@ -328,3 +328,245 @@ class HidenCloud:
             "X-CSRF-TOKEN": token
         }
         if xsrf_token:
+            from urllib.parse import unquote
+            headers["X-XSRF-TOKEN"] = unquote(xsrf_token)
+
+        try:
+            resp = self.session.post(renew_url, data=data, headers=headers, timeout=20)
+            if "invoice" in resp.url or "payment" in resp.url:
+                return True, "申请成功"
+            
+            soup_res = BeautifulSoup(resp.text, 'html.parser')
+            alert = soup_res.find(['div', 'span'], attrs={'role': 'alert'})
+            if alert:
+                alert_text = alert.get_text(strip=True)
+                if "only renew" in alert_text or "expires in" in alert_text:
+                    days_match = re.search(r'expires in (\d+) days', alert_text)
+                    days_info = f" (剩余 {days_match.group(1)} 天)" if days_match else ""
+                    return True, f"未到期{days_info}"
+                return False, f"申请失败: {alert_text}"
+            
+            if resp.status_code == 200 and "dash.hidencloud.com/service" in resp.url:
+                return True, "状态正常"
+                
+            return False, f"续期请求失败: {resp.status_code}"
+        except Exception as e:
+            return False, f"续期异常: {e}"
+
+    def pay_unpaid_invoices(self, service_id):
+        """检测并支付未支付订单"""
+        logger.info(f"正在检查服务 {service_id} 的待支付订单...")
+        invoice_list_url = f"{self.base_url}/service/{service_id}/invoices?where=unpaid"
+        try:
+            resp = self.session.get(invoice_list_url, timeout=20)
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            invoice_links = []
+            
+            for a in soup.find_all('a', href=True):
+                href = a['href']
+                if '/invoice/' in href and 'download' not in href:
+                    parent = a.find_parent(['tr', 'div', 'li'])
+                    if parent:
+                        parent_text = parent.get_text()
+                        if any(kw in parent_text for kw in ['Unpaid', '待支付', '未支付', '待付款', "Invoice"]):
+                            invoice_links.append(href)
+            
+            if not invoice_links:
+                return True, "无待支付订单"
+
+            success_count = 0
+            invoice_links = list(set(invoice_links))
+            
+            for inv_link in invoice_links:
+                if not inv_link.startswith('http'):
+                    inv_link = self.base_url + inv_link
+                
+                logger.info(f"  └ 正在处理账单页面: {inv_link.split('/')[-1]}")
+                inv_resp = self.session.get(inv_link, timeout=20)
+                inv_soup = BeautifulSoup(inv_resp.text, 'html.parser')
+                
+                pay_form = None
+                for form in inv_soup.find_all('form'):
+                    action = form.get('action', '')
+                    if 'balance/add' in action: continue
+                    
+                    btn = form.find(['button', 'input'], attrs={'type': 'submit'})
+                    if not btn: btn = form.find('button')
+                    
+                    if btn and ('支付' in btn.get_text() or 'Pay' in btn.get_text() or '确认' in btn.get_text()):
+                        pay_form = form
+                        break
+                
+                if not pay_form:
+                    for form in inv_soup.find_all('form'):
+                        action = form.get('action', '')
+                        if 'invoice' in action or 'payment' in action:
+                            pay_form = form
+                            break
+
+                if pay_form:
+                    action = pay_form.get('action', '')
+                    if not action.startswith('http'):
+                        action = self.base_url + action
+                        
+                    payload = {}
+                    for inp in pay_form.find_all('input'):
+                        name = inp.get('name')
+                        if name:
+                            payload[name] = inp.get('value', '')
+                    
+                    token = self.get_csrf_token(html=inv_resp.text)
+                    if token: payload['_token'] = token
+                    
+                    headers = {
+                        "Referer": inv_link,
+                        "X-CSRF-TOKEN": token or self.csrf_token
+                    }
+                    
+                    pay_resp = self.session.post(action, data=payload, headers=headers, timeout=20)
+                    if "成功" in pay_resp.text or "Success" in pay_resp.text or pay_resp.status_code == 200:
+                        success_count += 1
+                        logger.info("    ✅ 支付成功")
+                    else:
+                        logger.warning(f"    ❌ 支付失败 (状态码: {pay_resp.status_code})")
+                else:
+                    logger.warning("    ⚠️ 未能在账单页找到支付按钮，请检查页面结构")
+
+            return True, f"支付完成 ({success_count}/{len(invoice_links)} 成功)"
+        except Exception as e:
+            return False, f"支付异常: {e}"
+
+    def run_task(self):
+        """运行完整续费任务"""
+        if not self.check_login():
+            logger.error("❌ Cookie 已失效或无法访问 Dashboard")
+            self.send_tg_notification("❌ Cookie 已失效，请重新提取并更新 GitHub Secrets")
+            return
+
+        logger.info(f"账号 {self.username} 登录验证通过，开始执行任务...")
+        service_ids = self.get_service_ids()
+        if not service_ids:
+            logger.warning("未找到任何活跃服务")
+            return
+
+        results = []
+        success_count = 0
+        fail_count = 0
+        
+        for s_id in service_ids:
+            r_success, r_msg = self.renew_service(s_id)
+            p_success, p_msg = self.pay_unpaid_invoices(s_id)
+            
+            status_icon = "✅" if r_success and p_success else "❌"
+            results.append(f"{status_icon} **服务 {s_id}**\n   └ 续期: `{r_msg}`\n   └ 支付: `{p_msg}`")
+            
+            if r_success and p_success:
+                success_count += 1
+            else:
+                fail_count += 1
+
+        summary = f"📊 **执行统计**: 成功 `{success_count}` | 失败 `{fail_count}`\n\n"
+        report = summary + "\n".join(results)
+        
+        logger.info(f"任务完成报告:\n{report}")
+        self.send_tg_notification(report)
+
+        new_cookie_str = self.get_cookie_string()
+        if new_cookie_str != self.cookie_str:
+            logger.info("检测到 Cookie 已刷新，准备同步到本地及 GitHub Secrets")
+            self.update_github_secret(new_cookie_str)
+            self.update_local_config(new_cookie_str)
+
+    def update_local_config(self, new_cookie):
+        """同步更新本地 config.json"""
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(current_dir, "config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config_data = json.load(f)
+                
+                updated = False
+                for acc in config_data.get("accounts", []):
+                    if acc.get("cookie_str") == self.cookie_str or len(config_data.get("accounts", [])) == 1:
+                        acc["cookie_str"] = new_cookie
+                        updated = True
+                        break
+                
+                if updated:
+                    with open(config_path, 'w') as f:
+                        json.dump(config_data, f, indent=4, ensure_ascii=False)
+                    logger.info("✅ 本地 config.json 已同步更新")
+            except Exception as e:
+                logger.error(f"更新本地 config.json 失败: {e}")
+
+def main():
+    config = {}
+    env_cookies = os.environ.get("HIDEN_COOKIE")
+    env_proxy = os.environ.get("HIDEN_PROXY")  # 从环境变量获取全局代理
+    
+    accounts_to_run = []
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(current_dir, "config.json")
+    
+    # 优先从本地配置中解析，建立“Cookie -> 专属代理”的映射关系
+    config_proxies = {}
+    global_config_proxy = None
+
+    if os.path.exists(config_path):
+        logger.info("正在读取 config.json 配置文件...")
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                global_config_proxy = config.get("proxy")  # 整个 json 的全局代理
+                
+                accounts = config.get("accounts", [])
+                for acc in accounts:
+                    c_str = ""
+                    if acc.get("cookie_str"):
+                        c_str = acc.get("cookie_str")
+                    elif acc.get("cookies"):
+                        if isinstance(acc["cookies"], dict):
+                            c_str = "; ".join([f"{k}={v}" for k, v in acc["cookies"].items()])
+                        else:
+                            c_str = str(acc["cookies"])
+                    
+                    if c_str:
+                        # 记录此 Cookie 是否有单独绑定的独立代理
+                        if acc.get("proxy"):
+                            config_proxies[c_str] = acc.get("proxy")
+                        if not env_cookies:  # 如果没设置环境变量，直接用 config 的账号
+                            accounts_to_run.append(c_str)
+        except Exception as e:
+            logger.error(f"读取 config.json 失败: {e}")
+
+    # 如果有环境变量，以环境变量的账号为主
+    if env_cookies:
+        logger.info("从环境变量 HIDEN_COOKIE 加载账号信息")
+        accounts_to_run = [c.strip() for c in re.split(r'[&\n]', env_cookies) if c.strip()]
+
+    if not accounts_to_run:
+        logger.error("❌ 未找到任何可用的 HIDEN_COOKIE（环境变量及配置文件皆为空）")
+        return
+
+    # TG 配置
+    tg_config = {
+        "bot_token": os.environ.get("TG_BOT_TOKEN") or config.get("telegram", {}).get("bot_token"),
+        "chat_id": os.environ.get("TG_CHAT_ID") or config.get("telegram", {}).get("chat_id")
+    }
+
+    # 循环执行每个账号
+    for cookie_str in accounts_to_run:
+        if not cookie_str.strip(): continue
+        
+        # 代理优先级判定
+        final_proxy = config_proxies.get(cookie_str) or env_proxy or global_config_proxy
+        
+        try:
+            bot = HidenCloud(cookie_str, tg_config, proxy=final_proxy)
+            bot.run_task()
+        except Exception as e:
+            logger.error(f"处理账号时发生异常: {e}")
+
+if __name__ == "__main__":
+    main()
